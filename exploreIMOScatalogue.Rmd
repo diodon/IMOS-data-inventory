@@ -1,0 +1,213 @@
+---
+title: "Explore IMOS Catalogue"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(httr2)
+library(dplyr)
+library(purrr)
+library(lubridate)
+```
+
+## Get metadata records from IMOS catalogue
+
+```{r config}
+today    <- format(Sys.Date(), "%Y%m%d")
+base_url <- "https://catalogue-imos.aodn.org.au/geonetwork/srv/eng/q"
+
+query_params <- list(
+  type            = "dataset",
+  `_content_type` = "json",
+  fast            = "index",
+  resultType      = "details"
+)
+```
+
+```{r fetch-first-page}
+fetch_page <- function(from) {
+  request(base_url) |>
+    req_url_query(!!!query_params, from = from) |>
+    req_perform() |>
+    resp_body_json(simplifyVector = FALSE)
+}
+
+data      <- fetch_page(1)
+records   <- data$metadata
+n_records <- as.integer(data$summary$`@count`)
+cat("Total records:", n_records, "\n")
+```
+
+```{r fetch-all-pages}
+n_pages <- floor(n_records / 100)
+
+for (i in seq_len(n_pages)) {
+  page_data <- fetch_page(i * 100 + 1)
+  records   <- c(records, page_data$metadata)
+  cat("Page", i + 1, "of", n_pages + 1, "\n")
+}
+
+cat("Total records fetched:", length(records), "\n")
+```
+
+```{r build-dataframe}
+scalar <- function(x) if (is.null(x)) NA_character_ else as.character(x[[1]])
+
+extract_record <- function(rec) {
+  info <- rec$`geonet:info`
+  list(
+    id              = scalar(info$id),
+    uuid            = scalar(info$uuid),
+    category        = scalar(rec$category),
+    type            = scalar(rec$type),
+    title           = scalar(rec$title),
+    abstract        = scalar(rec$abstract),
+    keyword         = list(rec$keyword),
+    geoPolygon      = list(rec$geoPolygon),
+    geoBox          = list(rec$geoBox),
+    tempExtentBegin = scalar(rec$tempExtentBegin),
+    tempExtentEnd   = scalar(rec$tempExtentEnd),
+    creationDate    = scalar(rec$creationDate)
+  )
+}
+
+df <- bind_rows(map(records, extract_record))
+colnames(df)
+```
+
+```{r head}
+head(df)
+```
+
+## Extract WKT geometries
+
+Spatial extent information in the IMOS catalogue is spread across two fields — `geoPolygon` and `geoBox` — and neither is guaranteed to be present in every record. `geoPolygon` contains the actual polygon geometry as a WKT string or an array of WKT strings when multiple polygons are present. `geoBox` is a simpler bounding box encoded as a `minlon|minlat|maxlon|maxlat` string, used as a fallback when no polygon is available. Some records have both fields, some only one, and some have neither.
+
+To produce a single, consistent `wkt` column we apply the following logic: if `geoPolygon` is present we use it (merging multiple polygons into a `MULTIPOLYGON`); otherwise we fall back to constructing a bounding-box polygon from `geoBox`; if neither field is available the record gets a missing value.
+
+```{r geobox-to-wkt}
+geobox_to_wkt <- function(geobox) {
+  if (is.null(geobox) || length(geobox) == 0) return(NA_character_)
+
+  # single bbox string: "minlon|minlat|maxlon|maxlat"
+  if (is.character(geobox) && length(geobox) == 1) {
+    p <- strsplit(geobox, "\\|")[[1]]
+    return(sprintf(
+      "POLYGON((%s %s, %s %s, %s %s, %s %s, %s %s))",
+      p[1], p[2], p[3], p[2], p[3], p[4], p[1], p[4], p[1], p[2]
+    ))
+  }
+
+  # list of bbox strings (multiple extents)
+  if (is.list(geobox)) {
+    geobox <- as.character(unlist(geobox))
+    combined <- paste(geobox, collapse = "|")
+
+    if (grepl("POINT", combined)) {
+      pts <- map_chr(geobox, function(x) {
+        p <- strsplit(x, "\\|")[[1]]
+        sprintf("(%s %s)", p[1], p[2])
+      })
+      return(paste0("MULTIPOINT(", paste(pts, collapse = ","), ")"))
+    } else {
+      polys <- map_chr(geobox, function(x) {
+        p <- strsplit(x, "\\|")[[1]]
+        sprintf("((%s %s, %s %s, %s %s, %s %s, %s %s))",
+                p[1], p[2], p[3], p[2], p[3], p[4], p[1], p[4], p[1], p[2])
+      })
+      return(paste0("MULTIPOLYGON(", paste(polys, collapse = ","), ")"))
+    }
+  }
+
+  NA_character_
+}
+```
+
+```{r extract-wkt}
+extract_wkt <- function(geo_polygon, geo_box) {
+  # JSON array: list of WKT strings to merge into MULTIPOLYGON
+  if (is.list(geo_polygon) && length(geo_polygon) > 0) {
+    parts <- map_chr(geo_polygon, function(x) {
+      x <- as.character(x)
+      x <- gsub("MULTIPOLYGON \\(", "", x)
+      x <- gsub("POLYGON", "", x)
+      x <- gsub("\\)\\)\\)", "))", x)
+      x
+    })
+    return(paste0("MULTIPOLYGON (", paste(parts, collapse = ","), ")"))
+  }
+
+  # missing geoPolygon: fall back to geoBox
+  if (is.null(geo_polygon) || length(geo_polygon) == 0) {
+    return(geobox_to_wkt(geo_box))
+  }
+
+  # single WKT string
+  geo_str <- as.character(geo_polygon)
+  if (geo_str == "MULTIPOLYGON EMPTY") return(NA_character_)
+  geo_str
+}
+
+df <- df |>
+  mutate(wkt = map2_chr(geoPolygon, geoBox, extract_wkt))
+```
+
+## Save keywords
+
+```{r save-keywords}
+write.csv(
+  data.frame(keyword = map_chr(df$keyword, function(x) {
+    if (is.null(x)) NA_character_ else paste(unlist(x), collapse = ";")
+  })),
+  paste0("keywords_", today, ".csv"),
+  row.names = FALSE
+)
+```
+
+## Calculate temporal extent
+
+```{r temporal-extent}
+safe_date <- function(x) tryCatch(as.Date(substr(x, 1, 10)), error = function(e) NA_Date_)
+
+df <- df |>
+  mutate(
+    temporalExtent = case_when(
+      !is.na(tempExtentBegin) & !is.na(tempExtentEnd) ~
+        as.numeric(safe_date(tempExtentEnd) - safe_date(tempExtentBegin)) / 365.25,
+      .default = NA_real_
+    )
+  )
+```
+
+## Check for wrong temporal extents
+
+```{r wrong-temporal-extent}
+df_wrong_extent <- df |> filter(temporalExtent < 0)
+
+if (nrow(df_wrong_extent) > 0) {
+  df_wrong_extent |>
+    mutate(keyword = map_chr(keyword, function(x) {
+      if (is.null(x)) NA_character_ else paste(unlist(x), collapse = ";")
+    })) |>
+    mutate(across(where(is.list), ~ map_chr(.x, function(x) {
+      if (is.null(x)) NA_character_ else paste(unlist(x), collapse = "|")
+    }))) |>
+    write.csv(paste0("IMOS_wrongTemporalExtent_", today, ".csv"), row.names = FALSE)
+}
+```
+
+## Save to CSV
+
+```{r save-csv}
+df_out <- df |>
+  mutate(keyword = map_chr(keyword, function(x) {
+    if (is.null(x)) NA_character_ else paste(unlist(x), collapse = ";")
+  })) |>
+  mutate(across(where(is.list), ~ map_chr(.x, function(x) {
+    if (is.null(x)) NA_character_ else paste(unlist(x), collapse = "|")
+  })))
+
+write.csv(df_out, paste0("IMOS_datasets_", today, ".csv"), row.names = FALSE)
+```
