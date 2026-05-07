@@ -1,5 +1,7 @@
 # IMOS Data Inventory
 
+[![GitHub](https://img.shields.io/badge/GitHub-diodon%2FIMOS--data--inventory-blue?logo=github)](https://github.com/diodon/IMOS-data-inventory)
+
 Tools to inventory and characterise datasets available through the [IMOS](https://imos.org.au) (Integrated Marine Observing System) and [AODN](https://aodn.org.au) (Australian Ocean Data Network) GeoNetwork catalogues, developed in support of the [NESP Marine and Coastal Hub](https://nespmarinecoastal.edu.au) (MacHub) data uplift activities.
 
 ## Overview
